@@ -4,10 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -229,15 +226,12 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. UNIVERSAL CLONE OVERLAY (Rendered directly onto Track 1 via OverlayEffect)
-        if (compositeLayers.isNotEmpty()) {
-            val sourceUriToUse = overlaySourceUri ?: inputUri
+        // 1. UNIVERSAL CLONE OVERLAY (Composites the ML Kit cutout directly onto Track 1)
+        if (compositeLayers.isNotEmpty() && maskBitmapProvider != null) {
             for (layer in compositeLayers) {
                 if (layer.layerOrder > 0) {
                     overlayList.add(
                         UniversalCloneBitmapOverlay(
-                            context = context,
-                            overlayUri = sourceUriToUse,
                             layerDto = layer,
                             maskBitmapProvider = maskBitmapProvider,
                             targetWidth = resolvedWidth,
@@ -248,12 +242,12 @@ class Media3TransformerEngine(private val context: Context) {
             }
         }
 
-        // 2. Subtitles & Paraphrased Captions
+        // 2. Subtitles & Captions
         if (captions.isNotEmpty()) {
             overlayList.add(SubtitleBitmapOverlay(captions, resolvedWidth, resolvedHeight))
         }
 
-        // 3. Dynamic Tracking Indicators & Replacements
+        // 3. Dynamic Graphics
         if (replacementOverlays.isNotEmpty() || trackingIndicators.isNotEmpty()) {
             overlayList.add(
                 DynamicGraphicsOverlay(
@@ -265,7 +259,7 @@ class Media3TransformerEngine(private val context: Context) {
             )
         }
 
-        // 4. Intro/Outro Text Cards
+        // 4. Text Cards
         if (textCards.isNotEmpty()) {
             overlayList.add(TextCardOverlay(textCards))
         }
@@ -325,7 +319,7 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedOverlayAudio))
         }
 
-        // Audio Mixing: Injects Commentary Audio if present
+        // Audio Mixing: Commentary Audio
         val isCommentaryAudioValid = commentaryAudioUri != null && try {
             val path = commentaryAudioUri.path ?: ""
             val f = File(path)
@@ -342,7 +336,6 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Construct standard Media3 Composition
         val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
@@ -537,14 +530,12 @@ class Media3TransformerEngine(private val context: Context) {
 
     /**
      * Universal Video Clone Overlay.
-     * Composites secondary take video frames and AI cutout mattes directly onto Track 1's canvas.
-     * Renders strictly the segmented foreground subject (no geometric split wipe, no unmasked rectangle).
+     * Renders ML Kit's full-color foreground subject cutout directly onto Track 1's canvas.
+     * Completely eliminates the redundant, failing MediaMetadataRetriever during export.
      */
     private class UniversalCloneBitmapOverlay(
-        private val context: Context,
-        private val overlayUri: Uri,
         private val layerDto: RecipeCompositeLayerDto,
-        private val maskBitmapProvider: ((Long) -> Bitmap?)?,
+        private val maskBitmapProvider: (Long) -> Bitmap?,
         private val targetWidth: Int = 1080,
         private val targetHeight: Int = 1920
     ) : BitmapOverlay() {
@@ -552,67 +543,20 @@ class Media3TransformerEngine(private val context: Context) {
         private val frameBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         private val canvas: Canvas = Canvas(frameBitmap)
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        private val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-        }
-
-        private val retriever = MediaMetadataRetriever().apply {
-            try {
-                setDataSource(context, overlayUri)
-            } catch (_: Exception) {}
-        }
-
-        private val rotation: Int = try {
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-        } catch (_: Exception) { 0 }
-
-        private val rotationMatrix: Matrix? = if (rotation != 0) {
-            Matrix().apply { postRotate(rotation.toFloat()) }
-        } else null
-
         private val dstRect = Rect(0, 0, targetWidth, targetHeight)
         private val durationUs: Long = (layerDto.getResolvedEndMs() - layerDto.getResolvedStartMs()) * 1000L
-
-        private var lastFetchedUs: Long = -1L
-        private var lastDecodedFrame: Bitmap? = null
 
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             frameBitmap.eraseColor(Color.TRANSPARENT)
 
-            // Respect layer active duration
             if (durationUs > 0L && presentationTimeUs > durationUs) {
                 return frameBitmap
             }
 
-            val overlayFrameUs = presentationTimeUs
+            // ML Kit provides the full-color cut-out person with a transparent background
+            val cutoutPerson = maskBitmapProvider.invoke(presentationTimeUs)
 
-            // Fetch video frame (cached within ~33ms window to ensure high rendering throughput)
-            val rawFrame = if (lastDecodedFrame != null && kotlin.math.abs(overlayFrameUs - lastFetchedUs) < 33_000L) {
-                lastDecodedFrame
-            } else {
-                try {
-                    val frame = retriever.getFrameAtTime(overlayFrameUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                    if (frame != null) {
-                        lastDecodedFrame?.recycle()
-                        val uprightFrame = if (rotationMatrix != null) {
-                            Bitmap.createBitmap(frame, 0, 0, frame.width, frame.height, rotationMatrix, true).also {
-                                if (it != frame) frame.recycle()
-                            }
-                        } else {
-                            frame
-                        }
-                        lastDecodedFrame = uprightFrame
-                        lastFetchedUs = overlayFrameUs
-                        uprightFrame
-                    } else {
-                        lastDecodedFrame
-                    }
-                } catch (_: Exception) {
-                    lastDecodedFrame
-                }
-            }
-
-            if (rawFrame != null && !rawFrame.isRecycled) {
+            if (cutoutPerson != null && !cutoutPerson.isRecycled) {
                 val maskDto = layerDto.mask
                 val resolvedOpacity = layerDto.opacity.takeIf { it != 1.0f } ?: (maskDto?.opacity ?: 1.0f)
                 val resolvedXOffset = if (layerDto.xOffset != 0.0f) layerDto.xOffset else (maskDto?.xOffset ?: 0.0f)
@@ -621,7 +565,6 @@ class Media3TransformerEngine(private val context: Context) {
 
                 canvas.save()
 
-                // Apply Universal Transformations
                 val transX = resolvedXOffset * targetWidth
                 val transY = resolvedYOffset * targetHeight
                 if (transX != 0f || transY != 0f) {
@@ -632,14 +575,7 @@ class Media3TransformerEngine(private val context: Context) {
                 }
 
                 paint.alpha = (resolvedOpacity.coerceIn(0f, 1f) * 255).toInt()
-
-                // Strict AI Subject Cutout (CapCut-style Foreground Extraction)
-                val maskBitmap = maskBitmapProvider?.invoke(presentationTimeUs)
-                if (maskBitmap != null && !maskBitmap.isRecycled) {
-                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
-                    canvas.drawBitmap(maskBitmap, null, dstRect, maskPaint)
-                }
-
+                canvas.drawBitmap(cutoutPerson, null, dstRect, paint)
                 canvas.restore()
             }
 
