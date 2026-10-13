@@ -141,7 +141,7 @@ class Media3TransformerEngine(private val context: Context) {
         val mediaItem = MediaItem.fromUri(inputUri)
         val editedMediaItem = EditedMediaItem.Builder(mediaItem)
             .setRemoveAudio(stripAudio)
-            .setEffects(Effects(emptyList(), effects))
+            .setEffects(effects)
             .build()
 
         runTransformer(editedMediaItem, outputFile)
@@ -164,7 +164,7 @@ class Media3TransformerEngine(private val context: Context) {
         val mediaItem = MediaItem.fromUri(inputUri)
         val editedMediaItem = EditedMediaItem.Builder(mediaItem)
             .setRemoveAudio(stripAudio)
-            .setEffects(Effects(emptyList(), effects))
+            .setEffects(effects)
             .build()
 
         runTransformer(editedMediaItem, outputFile)
@@ -267,7 +267,7 @@ class Media3TransformerEngine(private val context: Context) {
                 .setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
                         .setStartPositionMs(baseStartMs)
-                        .setEndPositionMs(baseEndMs)
+                        .setEndPositionMs(endMs = baseEndMs)
                         .build()
                 )
                 .build()
