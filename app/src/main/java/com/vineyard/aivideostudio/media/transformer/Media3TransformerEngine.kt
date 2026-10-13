@@ -141,7 +141,7 @@ class Media3TransformerEngine(private val context: Context) {
         val mediaItem = MediaItem.fromUri(inputUri)
         val editedMediaItem = EditedMediaItem.Builder(mediaItem)
             .setRemoveAudio(stripAudio)
-            .setEffects(effects)
+            .setEffects(Effects(emptyList(), effects))
             .build()
 
         runTransformer(editedMediaItem, outputFile)
@@ -164,7 +164,7 @@ class Media3TransformerEngine(private val context: Context) {
         val mediaItem = MediaItem.fromUri(inputUri)
         val editedMediaItem = EditedMediaItem.Builder(mediaItem)
             .setRemoveAudio(stripAudio)
-            .setEffects(effects)
+            .setEffects(Effects(emptyList(), effects))
             .build()
 
         runTransformer(editedMediaItem, outputFile)
@@ -290,7 +290,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 2. Build Overlay Video Sequence (Track 2: The Left Clone)
+        // 2. Build Universal Overlay Video Sequences (Track 2+: Universal Clone & Cutout)
         // Passes natively into Media3's GPU pipeline for automatic hardware rotation correction
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
@@ -311,39 +311,53 @@ class Media3TransformerEngine(private val context: Context) {
                         floatArrayOf(0f, 0f, 1f, 1f)
                     }
 
-                    val isAiCutout = maskBitmapProvider != null ||
+                    val isCutoutClone = layer.isCutoutClone() ||
+                            maskDto?.isSubjectCutout() == true ||
+                            maskBitmapProvider != null ||
+                            maskDto?.shape.equals("ai_subject_matte", ignoreCase = true) ||
                             maskDto?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
+                            maskDto?.shape.equals("subject_cutout", ignoreCase = true) ||
                             maskDto?.shape.equals("auto_removal", ignoreCase = true)
 
-                    val resolvedMaskType = if (isAiCutout) {
+                    val resolvedMaskType = if (isCutoutClone) {
                         CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
                     } else if (maskDto != null) {
                         when (maskDto.shape.lowercase()) {
                             "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
-                            "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
+                            "linear_horizontal", "horizontal" -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
+                            "rectangle", "rect" -> CompositeMaskGlEffect.MaskType.RECTANGLE
                             "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
-                            else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
+                            else -> CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
                         }
                     } else {
-                        CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
                     }
 
-                    // Apply the feathered fade directly via GPU Shader
+                    val resolvedOpacity = layer.opacity.takeIf { it != 1.0f } ?: (maskDto?.opacity ?: 1.0f)
+                    val resolvedXOffset = if (layer.xOffset != 0.0f) layer.xOffset else (maskDto?.xOffset ?: 0.0f)
+                    val resolvedYOffset = if (layer.yOffset != 0.0f) layer.yOffset else (maskDto?.yOffset ?: 0.0f)
+                    val resolvedScale = if (layer.scale != 1.0f) layer.scale else (maskDto?.scale ?: 1.0f)
+
+                    // Apply Universal Composite Mask directly via GPU Shader
                     overlayEffects.add(
                         CompositeMaskGlEffect(
                             maskType = resolvedMaskType,
-                            startSplitPos = maskDto?.startSplitPos ?: 0.48f,
-                            endSplitPos = maskDto?.endSplitPos ?: 0.48f,
-                            feather = maskDto?.featherRadius ?: 0.03f,
+                            startSplitPos = maskDto?.startSplitPos ?: 0.5f,
+                            endSplitPos = maskDto?.endSplitPos ?: 0.5f,
+                            feather = maskDto?.featherRadius ?: 0.04f,
                             isInverted = maskDto?.isInverted ?: false,
                             rectBounds = boundsArray,
                             startTimeUs = 0L,
                             endTimeUs = Long.MAX_VALUE,
+                            opacity = resolvedOpacity,
+                            xOffset = resolvedXOffset,
+                            yOffset = resolvedYOffset,
+                            scale = resolvedScale,
                             maskBitmapProvider = maskBitmapProvider
                         )
                     )
 
-                    // Ensure Track 2 aligns with Track 1 aspect ratio
+                    // Ensure Overlay Track aligns with base aspect ratio
                     when (targetAspectRatio) {
                         "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
                         "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
@@ -362,19 +376,22 @@ class Media3TransformerEngine(private val context: Context) {
                         overlayEffects.add(ColorFilterGlEffect(colorGrade))
                     }
 
-                    val overlayMediaItem = if (overlaySourceUri != null) {
-                        MediaItem.fromUri(overlaySourceUri)
-                    } else {
-                        MediaItem.Builder()
-                            .setUri(inputUri)
-                            .setClippingConfiguration(
-                                MediaItem.ClippingConfiguration.Builder()
-                                    .setStartPositionMs(layer.getResolvedStartMs())
-                                    .setEndPositionMs(layer.getResolvedEndMs())
-                                    .build()
-                            )
-                            .build()
-                    }
+                    val startMs = layer.getResolvedStartMs()
+                    val endMs = layer.getResolvedEndMs()
+
+                    val overlayMediaItem = MediaItem.Builder()
+                        .setUri(sourceUriToUse)
+                        .apply {
+                            if (endMs > startMs) {
+                                setClippingConfiguration(
+                                    MediaItem.ClippingConfiguration.Builder()
+                                        .setStartPositionMs(startMs)
+                                        .setEndPositionMs(endMs)
+                                        .build()
+                                )
+                            }
+                        }
+                        .build()
 
                     val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
                         .setRemoveAudio(true) // Audio handled separately
