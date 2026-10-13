@@ -16,11 +16,11 @@ import androidx.media3.effect.SingleFrameGlShaderProgram
 /**
  * High-performance GPU-accelerated OpenGL ES 2.0 Effect for Media3 Transformer.
  * Performs dynamic feathered masking for clones, traveling mattes, wipes,
- * and AI Subject Cutout (CapCut-style Auto Background Removal) directly on hardware surfaces.
+ * and universal AI Subject Cutout (CapCut-style Auto Background Removal) directly on hardware surfaces.
  */
 @UnstableApi
 class CompositeMaskGlEffect(
-    val maskType: MaskType = MaskType.LINEAR_HORIZONTAL,
+    val maskType: MaskType = MaskType.AI_SUBJECT_MATTE,
     val startSplitPos: Float = 0.5f,
     val endSplitPos: Float = 0.5f,
     val feather: Float = 0.04f,
@@ -28,6 +28,10 @@ class CompositeMaskGlEffect(
     val rectBounds: FloatArray = floatArrayOf(0f, 0f, 1f, 1f), // xMin, yMin, xMax, yMax
     val startTimeUs: Long = 0L,
     val endTimeUs: Long = Long.MAX_VALUE,
+    val opacity: Float = 1.0f,
+    val xOffset: Float = 0.0f,
+    val yOffset: Float = 0.0f,
+    val scale: Float = 1.0f,
     val maskBitmapProvider: ((Long) -> Bitmap?)? = null // AI Cutout Matte Provider per frame
 ) : GlEffect {
 
@@ -36,7 +40,7 @@ class CompositeMaskGlEffect(
         LINEAR_VERTICAL(1.0f),   // Left vs Right split
         RECTANGLE(2.0f),         // Bounding Box matte
         RADIAL_CIRCLE(3.0f),     // Circular spotlight / portal matte
-        AI_SUBJECT_MATTE(4.0f)   // CapCut-style AI background removal (body cutout)
+        AI_SUBJECT_MATTE(4.0f)   // Universal CapCut-style AI background removal (body cutout)
     }
 
     @OptIn(UnstableApi::class)
@@ -77,40 +81,52 @@ internal class CompositeMaskShaderProgram(
             uniform float uIsActive;
             uniform vec4 uRectBounds;
             uniform float uHasMaskTex;
+            uniform vec2 uOffset;
+            uniform float uScale;
+            uniform float uOpacity;
 
             void main() {
-                vec4 baseColor = texture2D(uTexSampler, vTexCoords);
                 if (uIsActive < 0.5) {
-                    gl_FragColor = baseColor;
+                    gl_FragColor = texture2D(uTexSampler, vTexCoords);
                     return;
                 }
 
+                // Universal 2D Coordinate Transformation (Scale around center + Offset position)
+                vec2 coords = (vTexCoords - vec2(0.5, 0.5)) / max(uScale, 0.0001) + vec2(0.5, 0.5) - uOffset;
+
+                // Handle out-of-bounds regions for transformed clone overlay
+                if (coords.x < 0.0 || coords.x > 1.0 || coords.y < 0.0 || coords.y > 1.0) {
+                    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+                    return;
+                }
+
+                vec4 baseColor = texture2D(uTexSampler, coords);
                 float alpha = 1.0;
                 float feather = max(uFeather, 0.0001);
 
                 if (uMaskType < 0.5) {
                     // Linear Horizontal Split
-                    alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, vTexCoords.y);
+                    alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, coords.y);
                 } else if (uMaskType < 1.5) {
                     // Linear Vertical Split
-                    alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, vTexCoords.x);
+                    alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, coords.x);
                 } else if (uMaskType < 2.5) {
                     // Rectangle Box
-                    float left = smoothstep(uRectBounds.x - feather, uRectBounds.x + feather, vTexCoords.x);
-                    float right = 1.0 - smoothstep(uRectBounds.z - feather, uRectBounds.z + feather, vTexCoords.x);
-                    float top = smoothstep(uRectBounds.y - feather, uRectBounds.y + feather, vTexCoords.y);
-                    float bottom = 1.0 - smoothstep(uRectBounds.w - feather, uRectBounds.w + feather, vTexCoords.y);
+                    float left = smoothstep(uRectBounds.x - feather, uRectBounds.x + feather, coords.x);
+                    float right = 1.0 - smoothstep(uRectBounds.z - feather, uRectBounds.z + feather, coords.x);
+                    float top = smoothstep(uRectBounds.y - feather, uRectBounds.y + feather, coords.y);
+                    float bottom = 1.0 - smoothstep(uRectBounds.w - feather, uRectBounds.w + feather, coords.y);
                     alpha = left * right * top * bottom;
                 } else if (uMaskType < 3.5) {
                     // Radial Circle
-                    float dist = distance(vTexCoords, vec2(0.5, 0.5));
+                    float dist = distance(coords, vec2(0.5, 0.5));
                     alpha = 1.0 - smoothstep(uSplitPos - feather, uSplitPos + feather, dist);
                 } else {
-                    // AI Subject Matte Cutout (CapCut-style Auto Background Removal)
+                    // Universal AI Subject Matte Cutout (Foreground Separation)
                     if (uHasMaskTex > 0.5) {
-                        vec4 maskVal = texture2D(uMaskSampler, vTexCoords);
-                        // Supports alpha or grayscale luminance channel from ML Kit segmentation
-                        alpha = max(maskVal.r, maskVal.a);
+                        vec4 maskVal = texture2D(uMaskSampler, coords);
+                        // Accommodates grayscale luminance masks (R=G=B), alpha masks (A), or binary mattes
+                        alpha = max(maskVal.r, max(maskVal.g, max(maskVal.b, maskVal.a)));
                     } else {
                         alpha = 1.0;
                     }
@@ -120,7 +136,8 @@ internal class CompositeMaskShaderProgram(
                     alpha = 1.0 - alpha;
                 }
 
-                gl_FragColor = vec4(baseColor.rgb * alpha, baseColor.a * alpha);
+                float finalAlpha = baseColor.a * alpha * clamp(uOpacity, 0.0, 1.0);
+                gl_FragColor = vec4(baseColor.rgb * finalAlpha, finalAlpha);
             }
         """
     }
@@ -162,7 +179,6 @@ internal class CompositeMaskShaderProgram(
 
         glProgram.use()
         glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
-        // CRITICAL FIX: Always bind uMaskSampler to texture unit 1 so Media3 validation never throws IllegalStateException
         glProgram.setSamplerTexIdUniform("uMaskSampler", maskTexId, 1)
 
         glProgram.setFloatUniform("uMaskType", effect.maskType.typeId)
@@ -171,6 +187,9 @@ internal class CompositeMaskShaderProgram(
         glProgram.setFloatUniform("uInvert", if (effect.isInverted) 1.0f else 0.0f)
         glProgram.setFloatUniform("uIsActive", if (isActive) 1.0f else 0.0f)
         glProgram.setFloatsUniform("uRectBounds", effect.rectBounds)
+        glProgram.setFloatsUniform("uOffset", floatArrayOf(effect.xOffset, effect.yOffset))
+        glProgram.setFloatUniform("uScale", effect.scale)
+        glProgram.setFloatUniform("uOpacity", effect.opacity)
 
         // Upload AI Cutout Alpha Mask Texture if available for this frame
         if (effect.maskType == CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE && effect.maskBitmapProvider != null) {
