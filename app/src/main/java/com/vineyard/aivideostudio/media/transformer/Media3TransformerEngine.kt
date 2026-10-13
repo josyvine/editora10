@@ -267,7 +267,7 @@ class Media3TransformerEngine(private val context: Context) {
                 .setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
                         .setStartPositionMs(baseStartMs)
-                        .setEndPositionMs(endMs = baseEndMs)
+                        .setEndPositionMs(baseEndMs)
                         .build()
                 )
                 .build()
