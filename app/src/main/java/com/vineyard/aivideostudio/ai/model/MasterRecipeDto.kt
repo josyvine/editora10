@@ -73,7 +73,13 @@ data class RecipeCompositeLayerDto(
     @Json(name = "end_sec") val endSec: Double? = null,
     @Json(name = "playback_rate") val playbackRate: Float = 1.0f, // 1.0 = normal, -1.0 = reverse (Spider-Man trick)
     @Json(name = "layer_order") val layerOrder: Int = 1,          // 0 = base, 1 = overlay
-    @Json(name = "mask") val mask: RecipeCompositeMaskDto? = null
+    @Json(name = "mask") val mask: RecipeCompositeMaskDto? = null,
+    // Universal Clone & Cutout Extensions (CapCut style)
+    @Json(name = "opacity") val opacity: Float = 1.0f,
+    @Json(name = "x_offset") val xOffset: Float = 0.0f,
+    @Json(name = "y_offset") val yOffset: Float = 0.0f,
+    @Json(name = "scale") val scale: Float = 1.0f,
+    @Json(name = "clone_type") val cloneType: String? = null      // "subject_cutout", "pip", "universal_clone"
 ) {
     fun getResolvedStartMs(): Long {
         return if (startTimeMs > 0L) startTimeMs else ((startSec ?: 0.0) * 1000.0).toLong()
@@ -82,17 +88,45 @@ data class RecipeCompositeLayerDto(
     fun getResolvedEndMs(): Long {
         return if (endTimeMs > 0L) endTimeMs else ((endSec ?: 0.0) * 1000.0).toLong()
     }
+
+    fun isCutoutClone(): Boolean {
+        val type = cloneType?.lowercase()
+        val maskShape = mask?.shape?.lowercase()
+        return type == "subject_cutout" ||
+                type == "universal_clone" ||
+                maskShape == "ai_matte" ||
+                maskShape == "subject_cutout" ||
+                maskShape == "auto_cutout" ||
+                mask?.isSubjectCutout() == true
+    }
 }
 
 @JsonClass(generateAdapter = true)
 data class RecipeCompositeMaskDto(
-    @Json(name = "shape") val shape: String = "linear_horizontal", // "linear_horizontal", "linear_vertical", "rectangle", "radial_circle"
+    @Json(name = "shape") val shape: String = "ai_subject_matte", // "ai_subject_matte", "subject_cutout", "linear_horizontal", "linear_vertical", "rectangle", "radial_circle"
     @Json(name = "start_split_pos") val startSplitPos: Float = 0.5f,
     @Json(name = "end_split_pos") val endSplitPos: Float = 0.5f,
     @Json(name = "feather_radius") val featherRadius: Float = 0.04f,
     @Json(name = "is_inverted") val isInverted: Boolean = false,
-    @Json(name = "bounds") val bounds: NormalizedBoundsDto? = null
-)
+    @Json(name = "bounds") val bounds: NormalizedBoundsDto? = null,
+    // Universal Clone & Cutout Mask Attributes
+    @Json(name = "opacity") val opacity: Float = 1.0f,
+    @Json(name = "x_offset") val xOffset: Float = 0.0f,
+    @Json(name = "y_offset") val yOffset: Float = 0.0f,
+    @Json(name = "scale") val scale: Float = 1.0f,
+    @Json(name = "cutout_mode") val cutoutMode: String? = null    // "person", "foreground", "auto"
+) {
+    fun isSubjectCutout(): Boolean {
+        val s = shape.lowercase()
+        val mode = cutoutMode?.lowercase()
+        return s == "ai_subject_matte" ||
+                s == "subject_cutout" ||
+                s == "auto_cutout" ||
+                mode == "person" ||
+                mode == "foreground" ||
+                mode == "auto"
+    }
+}
 
 @JsonClass(generateAdapter = true)
 data class RecipeTextCardDto(
