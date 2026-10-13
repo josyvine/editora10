@@ -4,20 +4,17 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.LinearGradient
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
-import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.Shader
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Size
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.OverlaySettings
+import androidx.media3.common.VideoCompositorSettings
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Crop
@@ -25,6 +22,7 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.effect.SpeedChangeEffect
+import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.TextureOverlay
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -47,6 +45,7 @@ import com.vineyard.aivideostudio.core.result.AppError
 import com.vineyard.aivideostudio.core.result.AppResult
 import com.vineyard.aivideostudio.media.transformer.effects.BlurGlEffect
 import com.vineyard.aivideostudio.media.transformer.effects.ColorFilterGlEffect
+import com.vineyard.aivideostudio.media.transformer.effects.CompositeMaskGlEffect
 import com.vineyard.aivideostudio.media.transformer.overlays.DynamicGraphicsOverlay
 import com.vineyard.aivideostudio.media.transformer.overlays.TextCardOverlay
 import kotlinx.coroutines.Dispatchers
@@ -231,32 +230,6 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. UNIVERSAL CLONE OVERLAY: Renders secondary take with automatic orientation detection & parametric feathering
-        if (compositeLayers.isNotEmpty() && overlaySourceUri != null) {
-            val overlayFile = runCatching {
-                if (overlaySourceUri.scheme == "file") File(overlaySourceUri.path ?: "") else File(overlaySourceUri.path ?: "")
-            }.getOrNull()
-
-            if (overlayFile != null && overlayFile.exists()) {
-                val overlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
-                val maskDto = overlayLayer.mask
-                val splitPos = maskDto?.startSplitPos ?: 0.50f
-                val feather = maskDto?.featherRadius ?: 0.04f
-                val isInverted = maskDto?.isInverted ?: false
-
-                overlayList.add(
-                    UniversalCloneBitmapOverlay(
-                        overlayVideoFile = overlayFile,
-                        splitPos = splitPos,
-                        featherRadius = feather,
-                        isInverted = isInverted,
-                        targetWidth = resolvedWidth,
-                        targetHeight = resolvedHeight
-                    )
-                )
-            }
-        }
-
         if (captions.isNotEmpty()) {
             overlayList.add(SubtitleBitmapOverlay(captions, resolvedWidth, resolvedHeight))
         }
@@ -283,7 +256,7 @@ class Media3TransformerEngine(private val context: Context) {
         val shouldStripAudio = stripOriginalAudio
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 2. Build Base Video Sequence (Track 1)
+        // 1. Build Base Video Sequence (Track 1)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -321,7 +294,103 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 3. MIX OVERLAY AUDIO: Concurrently blends overlay dialogue/audio with base audio
+        // 2. Build Overlay Video Sequence (Track 2: The Left Clone)
+        // Passes natively into Media3's GPU pipeline for automatic hardware rotation correction
+        if (compositeLayers.isNotEmpty()) {
+            val sourceUriToUse = overlaySourceUri ?: inputUri
+
+            for (layer in compositeLayers) {
+                if (layer.layerOrder > 0) {
+                    val overlayEffects = mutableListOf<Effect>()
+                    val maskDto = layer.mask
+
+                    val boundsArray = if (maskDto?.bounds != null) {
+                        floatArrayOf(
+                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
+                        )
+                    } else {
+                        floatArrayOf(0f, 0f, 1f, 1f)
+                    }
+
+                    val isAiCutout = maskBitmapProvider != null ||
+                            maskDto?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
+                            maskDto?.shape.equals("auto_removal", ignoreCase = true)
+
+                    val resolvedMaskType = if (isAiCutout) {
+                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
+                    } else if (maskDto != null) {
+                        when (maskDto.shape.lowercase()) {
+                            "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                            "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
+                            "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
+                            else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
+                        }
+                    } else {
+                        CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                    }
+
+                    // Apply the feathered fade directly via GPU Shader
+                    overlayEffects.add(
+                        CompositeMaskGlEffect(
+                            maskType = resolvedMaskType,
+                            startSplitPos = maskDto?.startSplitPos ?: 0.48f,
+                            endSplitPos = maskDto?.endSplitPos ?: 0.48f,
+                            feather = maskDto?.featherRadius ?: 0.05f,
+                            isInverted = maskDto?.isInverted ?: false,
+                            rectBounds = boundsArray,
+                            startTimeUs = 0L,
+                            endTimeUs = Long.MAX_VALUE,
+                            maskBitmapProvider = maskBitmapProvider
+                        )
+                    )
+
+                    // Ensure Track 2 aligns with Track 1 aspect ratio
+                    when (targetAspectRatio) {
+                        "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
+                        "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
+                        "1:1" -> overlayEffects.add(0, Presentation.createForAspectRatio(1f, Presentation.LAYOUT_SCALE_TO_FIT))
+                    }
+
+                    if (zoomScale > 1.0f) {
+                        overlayEffects.add(
+                            ScaleAndRotateTransformation.Builder()
+                                .setScale(zoomScale, zoomScale)
+                                .build()
+                        )
+                    }
+
+                    if (colorGrade != null) {
+                        overlayEffects.add(ColorFilterGlEffect(colorGrade))
+                    }
+
+                    val overlayMediaItem = if (overlaySourceUri != null) {
+                        MediaItem.fromUri(overlaySourceUri)
+                    } else {
+                        MediaItem.Builder()
+                            .setUri(inputUri)
+                            .setClippingConfiguration(
+                                MediaItem.ClippingConfiguration.Builder()
+                                    .setStartPositionMs(layer.getResolvedStartMs())
+                                    .setEndPositionMs(layer.getResolvedEndMs())
+                                    .build()
+                            )
+                            .build()
+                    }
+
+                    val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
+                        .setRemoveAudio(true) // We add the audio separately to prevent phase issues
+                        .setEffects(Effects(emptyList(), overlayEffects))
+                        .build()
+
+                    masterSequenceList.add(EditedMediaItemSequence(editedOverlayItem))
+                }
+            }
+        }
+
+        // 3. Audio Mixing: Inject Overlay Audio Track
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null && !shouldStripAudio) {
             val overlayAudioItem = MediaItem.fromUri(overlaySourceUri)
             val editedOverlayAudio = EditedMediaItem.Builder(overlayAudioItem)
@@ -347,7 +416,24 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        val composition = Composition.Builder(masterSequenceList).build()
+        val compositionBuilder = Composition.Builder(masterSequenceList)
+
+        // 5. CRITICAL FIX: Activate Native GPU Hardware Video Compositor
+        // This tells Media3 to decode Track 1 and Track 2 in parallel, read Huawei's rotation metadata naturally, 
+        // rotate the frames upright automatically on the hardware, and blend them into one frame perfectly.
+        if (compositeLayers.isNotEmpty()) {
+            compositionBuilder.setVideoCompositorSettings(object : VideoCompositorSettings {
+                override fun getOutputSize(inputSizes: List<Size>): Size {
+                    return inputSizes.firstOrNull() ?: Size(resolvedWidth, resolvedHeight)
+                }
+
+                override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): OverlaySettings {
+                    return StaticOverlaySettings.Builder().build()
+                }
+            })
+        }
+
+        val composition = compositionBuilder.build()
         runTransformer(composition, outputFile)
     }
 
@@ -539,94 +625,6 @@ class Media3TransformerEngine(private val context: Context) {
         }
     }
 
-    /**
-     * Universal Clone Overlay Renderer.
-     * 1. Detects raw buffer orientation vs target aspect ratio dynamically on ANY Android device.
-     * 2. Automatically normalizes landscape/portrait mismatch so frames are never squashed or sideways.
-     * 3. Applies parametric feathered alpha blending across any position without hardcoded numbers.
-     */
-    private class UniversalCloneBitmapOverlay(
-        private val overlayVideoFile: File,
-        private val splitPos: Float = 0.50f,
-        private val featherRadius: Float = 0.04f,
-        private val isInverted: Boolean = false,
-        private val targetWidth: Int = 1080,
-        private val targetHeight: Int = 1920
-    ) : BitmapOverlay() {
-
-        private val retriever = MediaMetadataRetriever().apply {
-            setDataSource(overlayVideoFile.absolutePath)
-        }
-
-        private val rotationDegrees: Int = try {
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-        } catch (_: Exception) { 0 }
-
-        private val outputBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        private val canvas: Canvas = Canvas(outputBitmap)
-        private val paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        private val gradientPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-        }
-
-        init {
-            val splitPx = targetWidth * splitPos.coerceIn(0.05f, 0.95f)
-            val featherPx = targetWidth * featherRadius.coerceIn(0.001f, 0.20f)
-
-            // Fully parametric: isInverted dynamically chooses which side is kept opaque
-            val gradientColors = if (isInverted) {
-                intArrayOf(Color.TRANSPARENT, Color.WHITE)
-            } else {
-                intArrayOf(Color.WHITE, Color.TRANSPARENT)
-            }
-
-            gradientPaint.shader = LinearGradient(
-                splitPx - featherPx, 0f,
-                splitPx + featherPx, 0f,
-                gradientColors,
-                floatArrayOf(0f, 1f),
-                Shader.TileMode.CLAMP
-            )
-        }
-
-        override fun getBitmap(presentationTimeUs: Long): Bitmap {
-            outputBitmap.eraseColor(Color.TRANSPARENT)
-
-            val rawFrame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                ?: return outputBitmap
-
-            // UNIVERSAL ORIENTATION NORMALIZATION:
-            // Checks if target is portrait (height > width) while raw buffer is landscape (width > height), or vice versa.
-            val normalizedFrame = if (targetHeight > targetWidth && rawFrame.width > rawFrame.height) {
-                // Buffer is landscape, canvas is portrait: rotate into upright orientation
-                val angle = if (rotationDegrees != 0) rotationDegrees.toFloat() else 90f
-                val matrix = Matrix().apply { postRotate(angle) }
-                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, matrix, true).also {
-                    if (it != rawFrame) rawFrame.recycle()
-                }
-            } else if (targetWidth > targetHeight && rawFrame.height > rawFrame.width) {
-                // Buffer is portrait, canvas is landscape: rotate into landscape
-                val angle = if (rotationDegrees != 0) rotationDegrees.toFloat() else 90f
-                val matrix = Matrix().apply { postRotate(angle) }
-                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, matrix, true).also {
-                    if (it != rawFrame) rawFrame.recycle()
-                }
-            } else {
-                rawFrame
-            }
-
-            val scaledFrame = Bitmap.createScaledBitmap(normalizedFrame, targetWidth, targetHeight, true)
-            if (normalizedFrame != scaledFrame) normalizedFrame.recycle()
-
-            canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
-            canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
-
-            scaledFrame.recycle()
-            return outputBitmap
-        }
-    }
-
     private class SubtitleBitmapOverlay(
         private val captions: List<Caption>,
         private val targetWidth: Int = 1080,
@@ -660,7 +658,6 @@ class Media3TransformerEngine(private val context: Context) {
             val activeCaption = captions.firstOrNull { currentSec >= it.start && currentSec <= it.end }
             if (activeCaption != null && activeCaption.text.isNotBlank()) {
                 val posX = if (activeCaption.x > 1.0f) activeCaption.x / 100f else activeCaption.x
-
                 val rawY = if (activeCaption.y > 1.0f) activeCaption.y / 100f else activeCaption.y
                 val targetY = if (rawY in 0.75f..0.96f) 0.90f else rawY
 
