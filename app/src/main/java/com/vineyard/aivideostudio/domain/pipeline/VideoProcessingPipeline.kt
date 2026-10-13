@@ -936,29 +936,15 @@ class VideoProcessingPipeline(
                     )
 
                     // CapCut-Style Universal Background Removal (Subject Cutout):
-                    // Automatically triggers for any clone layer unless a legacy geometric split is explicitly requested
-                    val maskShape = overlayLayer.mask?.shape?.lowercase()
-                    val isGeometricSplit = maskShape == "linear_vertical" ||
-                            maskShape == "linear_horizontal" ||
-                            maskShape == "vertical" ||
-                            maskShape == "horizontal" ||
-                            maskShape == "rectangle" ||
-                            maskShape == "radial_circle"
-
-                    val isUniversalAiCutout = !isGeometricSplit ||
-                            overlayLayer.isCutoutClone() ||
-                            overlayLayer.mask?.isSubjectCutout() == true
-
-                    if (isUniversalAiCutout) {
-                        onStageChanged(PipelineStatus.TRIM_EXECUTION, "ML Kit extracting AI subject cutout masks...")
-                        logger.log(
-                            projectId,
-                            PipelineStatus.TRIM_EXECUTION,
-                            "Extracting universal on-device AI subject cutout masks (CapCut-style cutout)...",
-                            LogSeverity.INFO
-                        )
-                        maskBitmapProvider = extractAiSubjectMasks(projectId, tempOverlayFile, overlayEndMs - overlayStartMs)
-                    }
+                    // Automatically extracts on-device AI subject cutout masks for the overlay take
+                    onStageChanged(PipelineStatus.TRIM_EXECUTION, "ML Kit extracting AI subject cutout masks...")
+                    logger.log(
+                        projectId,
+                        PipelineStatus.TRIM_EXECUTION,
+                        "Extracting universal on-device AI subject cutout masks (CapCut-style cutout)...",
+                        LogSeverity.INFO
+                    )
+                    maskBitmapProvider = extractAiSubjectMasks(projectId, tempOverlayFile, overlayEndMs - overlayStartMs)
                 }
             }
         }
@@ -1127,16 +1113,10 @@ class VideoProcessingPipeline(
                 }
                 provider
             } else {
-                logger.log(
-                    projectId,
-                    PipelineStatus.TRIM_EXECUTION,
-                    "AI subject cutout returned empty masks; falling back to direct video composite.",
-                    LogSeverity.WARNING
-                )
                 null
             }
         } catch (e: Exception) {
-            logger.log(projectId, PipelineStatus.TRIM_EXECUTION, "AI cutout extraction skipped: ${e.message}", LogSeverity.WARNING)
+            logger.log(projectId, PipelineStatus.TRIM_EXECUTION, "AI cutout extraction error: ${e.message}", LogSeverity.WARNING)
             null
         } finally {
             try { retriever.release() } catch (_: Exception) {}
