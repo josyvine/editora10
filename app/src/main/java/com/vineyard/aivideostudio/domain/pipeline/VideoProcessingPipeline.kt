@@ -692,11 +692,16 @@ class VideoProcessingPipeline(
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             timelineMap = TimelineMapper.applyHighlightSplice(timelineMap, highlightSegments)
         } else if (hasCompositeLayers && recipe.editingPlan.segmentsToKeep.isEmpty()) {
-            // Universal duration resolution: automatically infers project duration from composite take length
-            val firstOverlay = compositeLayerDtos.firstOrNull { it.layerOrder > 0 } ?: compositeLayerDtos.first()
-            val overlayDurationSec = (firstOverlay.getResolvedEndMs() - firstOverlay.getResolvedStartMs()) / 1000.0
-            if (overlayDurationSec > 0.0) {
-                timelineMap = TimelineMap.identity(projectId, overlayDurationSec)
+            // Universal duration resolution: infers total timeline from base layer (or longest take)
+            val baseLayer = compositeLayerDtos.firstOrNull { it.layerOrder == 0 }
+            val effectiveProjectDurationSec = if (baseLayer != null && baseLayer.getResolvedEndMs() > baseLayer.getResolvedStartMs()) {
+                (baseLayer.getResolvedEndMs() - baseLayer.getResolvedStartMs()) / 1000.0
+            } else {
+                val maxTakeDurationMs = compositeLayerDtos.maxOfOrNull { it.getResolvedEndMs() - it.getResolvedStartMs() } ?: 0L
+                if (maxTakeDurationMs > 0L) maxTakeDurationMs / 1000.0 else rawSourceDuration
+            }
+            if (effectiveProjectDurationSec > 0.0) {
+                timelineMap = TimelineMap.identity(projectId, effectiveProjectDurationSec)
             }
         }
         if (speedSpecs.isNotEmpty()) {
@@ -952,7 +957,7 @@ class VideoProcessingPipeline(
                             "Extracting universal on-device AI subject cutout masks (CapCut-style cutout)...",
                             LogSeverity.INFO
                         )
-                        maskBitmapProvider = extractAiSubjectMasks(tempOverlayFile, overlayEndMs - overlayStartMs)
+                        maskBitmapProvider = extractAiSubjectMasks(projectId, tempOverlayFile, overlayEndMs - overlayStartMs)
                     }
                 }
             }
@@ -1038,9 +1043,10 @@ class VideoProcessingPipeline(
     /**
      * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
      * Rotates frames upright so ML Kit accurately detects and segments the human body without distortion,
-     * and manages bitmap memory safely without double-recycle crashes or leaks.
+     * logs diagnostics cleanly to the active project session, and ensures robust bitmap memory reclamation.
      */
     private suspend fun extractAiSubjectMasks(
+        projectId: String,
         videoFile: File,
         durationMs: Long
     ): ((Long) -> Bitmap?)? = withContext(Dispatchers.Default) {
@@ -1104,7 +1110,7 @@ class VideoProcessingPipeline(
 
             if (maskMap.isNotEmpty()) {
                 logger.log(
-                    "AI_CUTOUT",
+                    projectId,
                     PipelineStatus.TRIM_EXECUTION,
                     "Generated ${maskMap.size} upright AI subject cutout masks across ${durationMs}ms.",
                     LogSeverity.SUCCESS
@@ -1121,10 +1127,16 @@ class VideoProcessingPipeline(
                 }
                 provider
             } else {
+                logger.log(
+                    projectId,
+                    PipelineStatus.TRIM_EXECUTION,
+                    "AI subject cutout returned empty masks; falling back to direct video composite.",
+                    LogSeverity.WARNING
+                )
                 null
             }
         } catch (e: Exception) {
-            logger.log("AI_CUTOUT", PipelineStatus.TRIM_EXECUTION, "AI cutout extraction skipped: ${e.message}", LogSeverity.WARNING)
+            logger.log(projectId, PipelineStatus.TRIM_EXECUTION, "AI cutout extraction skipped: ${e.message}", LogSeverity.WARNING)
             null
         } finally {
             try { retriever.release() } catch (_: Exception) {}
