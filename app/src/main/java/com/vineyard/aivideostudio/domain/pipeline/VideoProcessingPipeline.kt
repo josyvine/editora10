@@ -930,17 +930,26 @@ class VideoProcessingPipeline(
                         LogSeverity.SUCCESS
                     )
 
-                    // CapCut-Style Auto Background Removal (Subject Cutout):
-                    // Extract on-device ML Kit foreground subject masks across Take 2
-                    val isAiCutoutRequested = overlayLayer.mask?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
-                            overlayLayer.mask?.shape.equals("auto_removal", ignoreCase = true)
+                    // CapCut-Style Universal Background Removal (Subject Cutout):
+                    // Automatically triggers for any clone layer unless a legacy geometric split is explicitly requested
+                    val maskShape = overlayLayer.mask?.shape?.lowercase()
+                    val isGeometricSplit = maskShape == "linear_vertical" ||
+                            maskShape == "linear_horizontal" ||
+                            maskShape == "vertical" ||
+                            maskShape == "horizontal" ||
+                            maskShape == "rectangle" ||
+                            maskShape == "radial_circle"
 
-                    if (isAiCutoutRequested) {
+                    val isUniversalAiCutout = !isGeometricSplit ||
+                            overlayLayer.isCutoutClone() ||
+                            overlayLayer.mask?.isSubjectCutout() == true
+
+                    if (isUniversalAiCutout) {
                         onStageChanged(PipelineStatus.TRIM_EXECUTION, "ML Kit extracting AI subject cutout masks...")
                         logger.log(
                             projectId,
                             PipelineStatus.TRIM_EXECUTION,
-                            "Extracting on-device AI subject cutout masks (CapCut Auto Removal)...",
+                            "Extracting universal on-device AI subject cutout masks (CapCut-style cutout)...",
                             LogSeverity.INFO
                         )
                         maskBitmapProvider = extractAiSubjectMasks(tempOverlayFile, overlayEndMs - overlayStartMs)
@@ -1028,7 +1037,8 @@ class VideoProcessingPipeline(
 
     /**
      * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
-     * Rotates frames upright so ML Kit accurately detects and segments the human body without distortion.
+     * Rotates frames upright so ML Kit accurately detects and segments the human body without distortion,
+     * and manages bitmap memory safely without double-recycle crashes or leaks.
      */
     private suspend fun extractAiSubjectMasks(
         videoFile: File,
@@ -1050,6 +1060,7 @@ class VideoProcessingPipeline(
 
             val segmenterOptions = SubjectSegmenterOptions.Builder()
                 .enableForegroundBitmap()
+                .enableForegroundConfidenceMask()
                 .build()
             val segmenter = SubjectSegmentation.getClient(segmenterOptions)
 
@@ -1060,17 +1071,22 @@ class VideoProcessingPipeline(
                 val timeUs = timeCursorMs * 1000L
                 val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 if (rawFrame != null) {
-                    try {
-                        // CRITICAL FIX: Rotate frame upright so ML Kit recognizes an upright human body
-                        val uprightFrame = if (rotationMatrix != null) {
-                            Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true).also {
-                                if (it != rawFrame) rawFrame.recycle()
+                    val frameToProcess = if (rotationMatrix != null) {
+                        try {
+                            val rotated = Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true)
+                            if (rotated != rawFrame) {
+                                rawFrame.recycle()
                             }
-                        } else {
+                            rotated
+                        } catch (_: Exception) {
                             rawFrame
                         }
+                    } else {
+                        rawFrame
+                    }
 
-                        val inputImage = InputImage.fromBitmap(uprightFrame, 0)
+                    try {
+                        val inputImage = InputImage.fromBitmap(frameToProcess, 0)
                         val result = Tasks.await(segmenter.process(inputImage))
                         val fgBitmap = result.foregroundBitmap
                         if (fgBitmap != null) {
@@ -1078,7 +1094,9 @@ class VideoProcessingPipeline(
                         }
                     } catch (_: Exception) {
                     } finally {
-                        rawFrame.recycle()
+                        if (!frameToProcess.isRecycled) {
+                            frameToProcess.recycle()
+                        }
                     }
                 }
                 timeCursorMs += frameStepMs
