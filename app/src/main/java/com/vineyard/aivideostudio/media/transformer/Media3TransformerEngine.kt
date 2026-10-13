@@ -4,7 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
@@ -41,7 +45,6 @@ import com.vineyard.aivideostudio.core.result.AppError
 import com.vineyard.aivideostudio.core.result.AppResult
 import com.vineyard.aivideostudio.media.transformer.effects.BlurGlEffect
 import com.vineyard.aivideostudio.media.transformer.effects.ColorFilterGlEffect
-import com.vineyard.aivideostudio.media.transformer.effects.CompositeMaskGlEffect
 import com.vineyard.aivideostudio.media.transformer.overlays.DynamicGraphicsOverlay
 import com.vineyard.aivideostudio.media.transformer.overlays.TextCardOverlay
 import kotlinx.coroutines.Dispatchers
@@ -226,10 +229,32 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
+        // 1. UNIVERSAL CLONE OVERLAY (Rendered directly onto Track 1 via OverlayEffect)
+        // Eliminates Media3 sequence dropping: burned directly onto the main video frame buffer.
+        if (compositeLayers.isNotEmpty()) {
+            val sourceUriToUse = overlaySourceUri ?: inputUri
+            for (layer in compositeLayers) {
+                if (layer.layerOrder > 0) {
+                    overlayList.add(
+                        UniversalCloneBitmapOverlay(
+                            context = context,
+                            overlayUri = sourceUriToUse,
+                            layerDto = layer,
+                            maskBitmapProvider = maskBitmapProvider,
+                            targetWidth = resolvedWidth,
+                            targetHeight = resolvedHeight
+                        )
+                    )
+                }
+            }
+        }
+
+        // 2. Subtitles & Paraphrased Captions
         if (captions.isNotEmpty()) {
             overlayList.add(SubtitleBitmapOverlay(captions, resolvedWidth, resolvedHeight))
         }
 
+        // 3. Dynamic Tracking Indicators & Replacements
         if (replacementOverlays.isNotEmpty() || trackingIndicators.isNotEmpty()) {
             overlayList.add(
                 DynamicGraphicsOverlay(
@@ -241,10 +266,12 @@ class Media3TransformerEngine(private val context: Context) {
             )
         }
 
+        // 4. Intro/Outro Text Cards
         if (textCards.isNotEmpty()) {
             overlayList.add(TextCardOverlay(textCards))
         }
 
+        // Hook all overlays (clones, captions, graphics) directly into Track 1's GPU pipeline
         if (overlayList.isNotEmpty()) {
             sharedVideoEffects.add(OverlayEffect(ImmutableList.copyOf(overlayList)))
         }
@@ -252,7 +279,7 @@ class Media3TransformerEngine(private val context: Context) {
         val shouldStripAudio = stripOriginalAudio
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 1. Build Base Video Sequence (Track 1)
+        // Build Base Video Sequence (Track 1)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -290,120 +317,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 2. Build Universal Overlay Video Sequences (Track 2+: Universal Clone & Cutout)
-        // Passes natively into Media3's GPU pipeline for automatic hardware rotation correction
-        if (compositeLayers.isNotEmpty()) {
-            val sourceUriToUse = overlaySourceUri ?: inputUri
-
-            for (layer in compositeLayers) {
-                if (layer.layerOrder > 0) {
-                    val overlayEffects = mutableListOf<Effect>()
-                    val maskDto = layer.mask
-
-                    val boundsArray = if (maskDto?.bounds != null) {
-                        floatArrayOf(
-                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
-                        )
-                    } else {
-                        floatArrayOf(0f, 0f, 1f, 1f)
-                    }
-
-                    val isCutoutClone = layer.isCutoutClone() ||
-                            maskDto?.isSubjectCutout() == true ||
-                            maskBitmapProvider != null ||
-                            maskDto?.shape.equals("ai_subject_matte", ignoreCase = true) ||
-                            maskDto?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
-                            maskDto?.shape.equals("subject_cutout", ignoreCase = true) ||
-                            maskDto?.shape.equals("auto_removal", ignoreCase = true)
-
-                    val resolvedMaskType = if (isCutoutClone) {
-                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
-                    } else if (maskDto != null) {
-                        when (maskDto.shape.lowercase()) {
-                            "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
-                            "linear_horizontal", "horizontal" -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
-                            "rectangle", "rect" -> CompositeMaskGlEffect.MaskType.RECTANGLE
-                            "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
-                            else -> CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
-                        }
-                    } else {
-                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
-                    }
-
-                    val resolvedOpacity = layer.opacity.takeIf { it != 1.0f } ?: (maskDto?.opacity ?: 1.0f)
-                    val resolvedXOffset = if (layer.xOffset != 0.0f) layer.xOffset else (maskDto?.xOffset ?: 0.0f)
-                    val resolvedYOffset = if (layer.yOffset != 0.0f) layer.yOffset else (maskDto?.yOffset ?: 0.0f)
-                    val resolvedScale = if (layer.scale != 1.0f) layer.scale else (maskDto?.scale ?: 1.0f)
-
-                    // Apply Universal Composite Mask directly via GPU Shader
-                    overlayEffects.add(
-                        CompositeMaskGlEffect(
-                            maskType = resolvedMaskType,
-                            startSplitPos = maskDto?.startSplitPos ?: 0.5f,
-                            endSplitPos = maskDto?.endSplitPos ?: 0.5f,
-                            feather = maskDto?.featherRadius ?: 0.04f,
-                            isInverted = maskDto?.isInverted ?: false,
-                            rectBounds = boundsArray,
-                            startTimeUs = 0L,
-                            endTimeUs = Long.MAX_VALUE,
-                            opacity = resolvedOpacity,
-                            xOffset = resolvedXOffset,
-                            yOffset = resolvedYOffset,
-                            scale = resolvedScale,
-                            maskBitmapProvider = maskBitmapProvider
-                        )
-                    )
-
-                    // Ensure Overlay Track aligns with base aspect ratio
-                    when (targetAspectRatio) {
-                        "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
-                        "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
-                        "1:1" -> overlayEffects.add(0, Presentation.createForAspectRatio(1f, Presentation.LAYOUT_SCALE_TO_FIT))
-                    }
-
-                    if (zoomScale > 1.0f) {
-                        overlayEffects.add(
-                            ScaleAndRotateTransformation.Builder()
-                                .setScale(zoomScale, zoomScale)
-                                .build()
-                        )
-                    }
-
-                    if (colorGrade != null) {
-                        overlayEffects.add(ColorFilterGlEffect(colorGrade))
-                    }
-
-                    val startMs = layer.getResolvedStartMs()
-                    val endMs = layer.getResolvedEndMs()
-
-                    val overlayMediaItem = MediaItem.Builder()
-                        .setUri(sourceUriToUse)
-                        .apply {
-                            if (endMs > startMs) {
-                                setClippingConfiguration(
-                                    MediaItem.ClippingConfiguration.Builder()
-                                        .setStartPositionMs(startMs)
-                                        .setEndPositionMs(endMs)
-                                        .build()
-                                )
-                            }
-                        }
-                        .build()
-
-                    val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
-                        .setRemoveAudio(true) // Audio handled separately
-                        .setEffects(Effects(emptyList(), overlayEffects))
-                        .build()
-
-                    masterSequenceList.add(EditedMediaItemSequence(editedOverlayItem))
-                }
-            }
-        }
-
-        // 3. Audio Mixing: Inject Overlay Audio Track
+        // Audio Mixing: Injects Overlay Take Audio Track into the composition mixer
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null && !shouldStripAudio) {
             val overlayAudioItem = MediaItem.fromUri(overlaySourceUri)
             val editedOverlayAudio = EditedMediaItem.Builder(overlayAudioItem)
@@ -412,7 +326,7 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedOverlayAudio))
         }
 
-        // 4. Injects Commentary Audio if present
+        // Audio Mixing: Injects Commentary Audio if present
         val isCommentaryAudioValid = commentaryAudioUri != null && try {
             val path = commentaryAudioUri.path ?: ""
             val f = File(path)
@@ -429,7 +343,7 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Construct standard Media3 Composition (Fully compatible with version 1.5.1 without compiling errors)
+        // Construct standard Media3 Composition
         val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
@@ -619,6 +533,131 @@ class Media3TransformerEngine(private val context: Context) {
             try {
                 activeTransformer?.cancel()
             } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * High-Performance Universal Video Clone Overlay.
+     * Composites secondary take video frames and AI cutout mattes directly onto Track 1's canvas.
+     * Guarantees 100% visibility on the exported video without relying on multi-sequence video routing.
+     */
+    private class UniversalCloneBitmapOverlay(
+        private val context: Context,
+        private val overlayUri: Uri,
+        private val layerDto: RecipeCompositeLayerDto,
+        private val maskBitmapProvider: ((Long) -> Bitmap?)?,
+        private val targetWidth: Int = 1080,
+        private val targetHeight: Int = 1920
+    ) : BitmapOverlay() {
+
+        private val frameBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        private val canvas: Canvas = Canvas(frameBitmap)
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        }
+
+        private val retriever = MediaMetadataRetriever().apply {
+            try {
+                setDataSource(context, overlayUri)
+            } catch (_: Exception) {}
+        }
+
+        private val rotation: Int = try {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+        } catch (_: Exception) { 0 }
+
+        private val rotationMatrix: Matrix? = if (rotation != 0) {
+            Matrix().apply { postRotate(rotation.toFloat()) }
+        } else null
+
+        private val dstRect = Rect(0, 0, targetWidth, targetHeight)
+        private val durationUs: Long = (layerDto.getResolvedEndMs() - layerDto.getResolvedStartMs()) * 1000L
+
+        private var lastFetchedUs: Long = -1L
+        private var lastDecodedFrame: Bitmap? = null
+
+        override fun getBitmap(presentationTimeUs: Long): Bitmap {
+            frameBitmap.eraseColor(Color.TRANSPARENT)
+
+            // Respect layer active duration
+            if (durationUs > 0L && presentationTimeUs > durationUs) {
+                return frameBitmap
+            }
+
+            val overlayFrameUs = presentationTimeUs
+
+            // Fetch video frame (cached within ~33ms window to ensure high rendering throughput)
+            val rawFrame = if (lastDecodedFrame != null && kotlin.math.abs(overlayFrameUs - lastFetchedUs) < 33_000L) {
+                lastDecodedFrame
+            } else {
+                try {
+                    val frame = retriever.getFrameAtTime(overlayFrameUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    if (frame != null) {
+                        lastDecodedFrame?.recycle()
+                        val uprightFrame = if (rotationMatrix != null) {
+                            Bitmap.createBitmap(frame, 0, 0, frame.width, frame.height, rotationMatrix, true).also {
+                                if (it != frame) frame.recycle()
+                            }
+                        } else {
+                            frame
+                        }
+                        lastDecodedFrame = uprightFrame
+                        lastFetchedUs = overlayFrameUs
+                        uprightFrame
+                    } else {
+                        lastDecodedFrame
+                    }
+                } catch (_: Exception) {
+                    lastDecodedFrame
+                }
+            }
+
+            if (rawFrame != null && !rawFrame.isRecycled) {
+                val maskDto = layerDto.mask
+                val resolvedOpacity = layerDto.opacity.takeIf { it != 1.0f } ?: (maskDto?.opacity ?: 1.0f)
+                val resolvedXOffset = if (layerDto.xOffset != 0.0f) layerDto.xOffset else (maskDto?.xOffset ?: 0.0f)
+                val resolvedYOffset = if (layerDto.yOffset != 0.0f) layerDto.yOffset else (maskDto?.yOffset ?: 0.0f)
+                val resolvedScale = if (layerDto.scale != 1.0f) layerDto.scale else (maskDto?.scale ?: 1.0f)
+
+                canvas.save()
+
+                // Apply Universal Transformations
+                val transX = resolvedXOffset * targetWidth
+                val transY = resolvedYOffset * targetHeight
+                if (transX != 0f || transY != 0f) {
+                    canvas.translate(transX, transY)
+                }
+                if (resolvedScale != 1.0f && resolvedScale > 0.0f) {
+                    canvas.scale(resolvedScale, resolvedScale, targetWidth / 2f, targetHeight / 2f)
+                }
+
+                paint.alpha = (resolvedOpacity.coerceIn(0f, 1f) * 255).toInt()
+
+                // AI Cutout Matte application (CapCut Auto Background Removal)
+                val maskBitmap = maskBitmapProvider?.invoke(presentationTimeUs)
+                if (maskBitmap != null && !maskBitmap.isRecycled) {
+                    // Draw video frame to canvas
+                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
+                    // Mask pixels: keep only foreground body
+                    canvas.drawBitmap(maskBitmap, null, dstRect, maskPaint)
+                } else if (maskDto != null && (maskDto.shape.contains("linear") || maskDto.shape.contains("vertical"))) {
+                    // Geometric split fallback if explicitly configured
+                    val splitX = (maskDto.startSplitPos * targetWidth).toInt()
+                    val clipRect = if (maskDto.isInverted) Rect(0, 0, splitX, targetHeight) else Rect(splitX, 0, targetWidth, targetHeight)
+                    canvas.save()
+                    canvas.clipRect(clipRect)
+                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
+                    canvas.restore()
+                } else {
+                    // Full-frame alpha overlay
+                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
+                }
+
+                canvas.restore()
+            }
+
+            return frameBitmap
         }
     }
 
