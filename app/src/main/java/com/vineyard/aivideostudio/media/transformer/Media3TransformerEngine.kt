@@ -9,12 +9,9 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.util.Size
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
-import androidx.media3.common.OverlaySettings
-import androidx.media3.common.VideoCompositorSettings
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Crop
@@ -22,7 +19,6 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.effect.SpeedChangeEffect
-import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.TextureOverlay
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -338,7 +334,7 @@ class Media3TransformerEngine(private val context: Context) {
                             maskType = resolvedMaskType,
                             startSplitPos = maskDto?.startSplitPos ?: 0.48f,
                             endSplitPos = maskDto?.endSplitPos ?: 0.48f,
-                            feather = maskDto?.featherRadius ?: 0.05f,
+                            feather = maskDto?.featherRadius ?: 0.03f,
                             isInverted = maskDto?.isInverted ?: false,
                             rectBounds = boundsArray,
                             startTimeUs = 0L,
@@ -381,7 +377,7 @@ class Media3TransformerEngine(private val context: Context) {
                     }
 
                     val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
-                        .setRemoveAudio(true) // We add the audio separately to prevent phase issues
+                        .setRemoveAudio(true) // Audio handled separately
                         .setEffects(Effects(emptyList(), overlayEffects))
                         .build()
 
@@ -416,24 +412,8 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        val compositionBuilder = Composition.Builder(masterSequenceList)
-
-        // 5. CRITICAL FIX: Activate Native GPU Hardware Video Compositor
-        // This tells Media3 to decode Track 1 and Track 2 in parallel, read Huawei's rotation metadata naturally, 
-        // rotate the frames upright automatically on the hardware, and blend them into one frame perfectly.
-        if (compositeLayers.isNotEmpty()) {
-            compositionBuilder.setVideoCompositorSettings(object : VideoCompositorSettings {
-                override fun getOutputSize(inputSizes: List<Size>): Size {
-                    return inputSizes.firstOrNull() ?: Size(resolvedWidth, resolvedHeight)
-                }
-
-                override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): OverlaySettings {
-                    return StaticOverlaySettings.Builder().build()
-                }
-            })
-        }
-
-        val composition = compositionBuilder.build()
+        // Construct standard Media3 Composition (Fully compatible with version 1.5.1 without compiling errors)
+        val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
 
@@ -709,39 +689,41 @@ class Media3TransformerEngine(private val context: Context) {
 
                 val lineHeight = scaledFontSize * 1.25f
                 val totalTextHeight = lines.size * lineHeight
-                val longestLineWidth = lines.maxOfOrNull { textPaint.measureText(it) } ?: maxTextWidth
+                let {
+                    val longestLineWidth = lines.maxOfOrNull { textPaint.measureText(it) } ?: maxTextWidth
 
-                val padH = 36f
-                val padV = 20f
-                val minConcealerWidth = targetWidth * 0.82f
-                val maskWidth = maxOf(longestLineWidth + (padH * 2), minConcealerWidth)
+                    val padH = 36f
+                    val padV = 20f
+                    val minConcealerWidth = targetWidth * 0.82f
+                    val maskWidth = maxOf(longestLineWidth + (padH * 2), minConcealerWidth)
 
-                val pillRect = RectF(
-                    x - (maskWidth / 2f),
-                    y - (totalTextHeight / 2f) - padV,
-                    x + (maskWidth / 2f),
-                    y + (totalTextHeight / 2f) + padV
-                )
+                    val pillRect = RectF(
+                        x - (maskWidth / 2f),
+                        y - (totalTextHeight / 2f) - padV,
+                        x + (maskWidth / 2f),
+                        y + (totalTextHeight / 2f) + padV
+                    )
 
-                val bgHex = activeCaption.backgroundColorHex
-                backgroundPillPaint.color = try {
-                    if (!bgHex.isNullOrBlank() && bgHex != "#00000000") {
-                        Color.parseColor(bgHex)
-                    } else {
+                    val bgHex = activeCaption.backgroundColorHex
+                    backgroundPillPaint.color = try {
+                        if (!bgHex.isNullOrBlank() && bgHex != "#00000000") {
+                            Color.parseColor(bgHex)
+                        } else {
+                            Color.BLACK
+                        }
+                    } catch (_: Exception) {
                         Color.BLACK
                     }
-                } catch (_: Exception) {
-                    Color.BLACK
-                }
-                backgroundPillPaint.alpha = 255
+                    backgroundPillPaint.alpha = 255
 
-                canvas.drawRoundRect(pillRect, 22f, 22f, backgroundPillPaint)
+                    canvas.drawRoundRect(pillRect, 22f, 22f, backgroundPillPaint)
 
-                val startY = y - (totalTextHeight / 2f) + scaledFontSize * 0.85f
-                for ((lineIdx, lineText) in lines.withIndex()) {
-                    val lineY = startY + (lineIdx * lineHeight)
-                    canvas.drawText(lineText, x, lineY, strokePaint)
-                    canvas.drawText(lineText, x, lineY, textPaint)
+                    val startY = y - (totalTextHeight / 2f) + scaledFontSize * 0.85f
+                    for ((lineIdx, lineText) in lines.withIndex()) {
+                        val lineY = startY + (lineIdx * lineHeight)
+                        canvas.drawText(lineText, x, lineY, strokePaint)
+                        canvas.drawText(lineText, x, lineY, textPaint)
+                    }
                 }
             }
 
