@@ -230,7 +230,6 @@ class Media3TransformerEngine(private val context: Context) {
         val overlayList = mutableListOf<TextureOverlay>()
 
         // 1. UNIVERSAL CLONE OVERLAY (Rendered directly onto Track 1 via OverlayEffect)
-        // Eliminates Media3 sequence dropping: burned directly onto the main video frame buffer.
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
             for (layer in compositeLayers) {
@@ -537,9 +536,9 @@ class Media3TransformerEngine(private val context: Context) {
     }
 
     /**
-     * High-Performance Universal Video Clone Overlay.
+     * Universal Video Clone Overlay.
      * Composites secondary take video frames and AI cutout mattes directly onto Track 1's canvas.
-     * Guarantees 100% visibility on the exported video without relying on multi-sequence video routing.
+     * Renders strictly the segmented foreground subject (no geometric split wipe, no unmasked rectangle).
      */
     private class UniversalCloneBitmapOverlay(
         private val context: Context,
@@ -634,24 +633,11 @@ class Media3TransformerEngine(private val context: Context) {
 
                 paint.alpha = (resolvedOpacity.coerceIn(0f, 1f) * 255).toInt()
 
-                // AI Cutout Matte application (CapCut Auto Background Removal)
+                // Strict AI Subject Cutout (CapCut-style Foreground Extraction)
                 val maskBitmap = maskBitmapProvider?.invoke(presentationTimeUs)
                 if (maskBitmap != null && !maskBitmap.isRecycled) {
-                    // Draw video frame to canvas
                     canvas.drawBitmap(rawFrame, null, dstRect, paint)
-                    // Mask pixels: keep only foreground body
                     canvas.drawBitmap(maskBitmap, null, dstRect, maskPaint)
-                } else if (maskDto != null && (maskDto.shape.contains("linear") || maskDto.shape.contains("vertical"))) {
-                    // Geometric split fallback if explicitly configured
-                    val splitX = (maskDto.startSplitPos * targetWidth).toInt()
-                    val clipRect = if (maskDto.isInverted) Rect(0, 0, splitX, targetHeight) else Rect(splitX, 0, targetWidth, targetHeight)
-                    canvas.save()
-                    canvas.clipRect(clipRect)
-                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
-                    canvas.restore()
-                } else {
-                    // Full-frame alpha overlay
-                    canvas.drawBitmap(rawFrame, null, dstRect, paint)
                 }
 
                 canvas.restore()
