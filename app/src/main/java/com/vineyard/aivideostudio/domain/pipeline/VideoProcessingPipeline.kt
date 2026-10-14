@@ -1028,8 +1028,7 @@ class VideoProcessingPipeline(
 
     /**
      * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
-     * Logs deep, detailed diagnostic information to the system console for every processing step,
-     * reports frame-by-frame extraction milestones, and surfaces all errors explicitly.
+     * Evaluates frame aspect ratio dynamically so upright portrait frames are never double-rotated sideways.
      */
     private suspend fun extractAiSubjectMasks(
         projectId: String,
@@ -1049,18 +1048,15 @@ class VideoProcessingPipeline(
 
             retriever.setDataSource(videoFile.absolutePath)
 
-            // Extract sensor rotation
+            // Extract sensor rotation metadata
             val rotationDegrees = try {
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
             } catch (_: Exception) { 0 }
-            val rotationMatrix = if (rotationDegrees != 0) {
-                Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-            } else null
 
             logger.log(
                 projectId,
                 PipelineStatus.TRIM_EXECUTION,
-                "Initializing ML Kit Subject Segmenter (Video rotation: ${rotationDegrees}°)...",
+                "Initializing ML Kit Subject Segmenter (Container rotation metadata: ${rotationDegrees}°)...",
                 LogSeverity.INFO
             )
 
@@ -1080,9 +1076,19 @@ class VideoProcessingPipeline(
 
                 if (rawFrame != null) {
                     decodedCount++
-                    val frameToProcess = if (rotationMatrix != null) {
+
+                    // UNIVERSAL ORIENTATION LOGIC:
+                    // Only apply matrix rotation if the decoded bitmap is physically in landscape
+                    // (width > height) while container metadata flags a portrait video (90° or 270°).
+                    // If rawFrame is already portrait (height >= width), it is already upright and must NOT be rotated.
+                    val isBitmapLandscape = rawFrame.width > rawFrame.height
+                    val isRotationPortrait = (rotationDegrees == 90 || rotationDegrees == 270)
+                    val needsUprightRotation = isBitmapLandscape && isRotationPortrait
+
+                    val frameToProcess = if (needsUprightRotation) {
                         try {
-                            val rotated = Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true)
+                            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                            val rotated = Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, matrix, true)
                             if (rotated != rawFrame) {
                                 rawFrame.recycle()
                             }
