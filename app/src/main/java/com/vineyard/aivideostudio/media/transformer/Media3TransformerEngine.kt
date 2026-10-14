@@ -545,7 +545,8 @@ class Media3TransformerEngine(private val context: Context) {
     /**
      * Universal Video Clone Overlay.
      * Renders ML Kit's full-color foreground subject cutout directly onto Track 1's canvas.
-     * Completely eliminates the redundant, failing MediaMetadataRetriever during export.
+     * Eliminates sudden disappearance by holding the final frame (freeze-frame hold) until the scene ends,
+     * and anchors the vertical scale to the bottom baseline to eliminate floating gaps above the desk.
      */
     private class UniversalCloneBitmapOverlay(
         private val layerDto: RecipeCompositeLayerDto,
@@ -560,17 +561,26 @@ class Media3TransformerEngine(private val context: Context) {
         private val dstRect = Rect(0, 0, targetWidth, targetHeight)
         private val durationUs: Long = (layerDto.getResolvedEndMs() - layerDto.getResolvedStartMs()) * 1000L
 
+        // Holds the last valid cutout frame so the person stays naturally seated in the scene
+        private var lastValidCutout: Bitmap? = null
+
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             frameBitmap.eraseColor(Color.TRANSPARENT)
 
-            if (durationUs > 0L && presentationTimeUs > durationUs) {
-                return frameBitmap
+            // CapCut-style Freeze Frame Hold:
+            // When the overlay take reaches its end earlier than the base scene (e.g. 5.0s < 7.5s),
+            // clamp the lookup time to durationUs so it continues holding the seated actor in frame.
+            val frameLookupUs = if (durationUs > 0L) {
+                minOf(presentationTimeUs, durationUs)
+            } else {
+                presentationTimeUs
             }
 
-            // ML Kit provides the full-color cut-out person with a transparent background
-            val cutoutPerson = maskBitmapProvider.invoke(presentationTimeUs)
+            val cutoutPerson = maskBitmapProvider.invoke(frameLookupUs) ?: lastValidCutout
 
             if (cutoutPerson != null && !cutoutPerson.isRecycled) {
+                lastValidCutout = cutoutPerson
+
                 val maskDto = layerDto.mask
                 val resolvedOpacity = layerDto.opacity.takeIf { it != 1.0f } ?: (maskDto?.opacity ?: 1.0f)
                 val resolvedXOffset = if (layerDto.xOffset != 0.0f) layerDto.xOffset else (maskDto?.xOffset ?: 0.0f)
@@ -584,8 +594,12 @@ class Media3TransformerEngine(private val context: Context) {
                 if (transX != 0f || transY != 0f) {
                     canvas.translate(transX, transY)
                 }
+
+                // ANCHOR SCALE TO THE BOTTOM BASELINE:
+                // Anchoring vertical scale to the bottom edge (targetHeight) keeps the person's torso
+                // and arms firmly grounded on the table rather than floating into the air.
                 if (resolvedScale != 1.0f && resolvedScale > 0.0f) {
-                    canvas.scale(resolvedScale, resolvedScale, targetWidth / 2f, targetHeight / 2f)
+                    canvas.scale(resolvedScale, resolvedScale, targetWidth / 2f, targetHeight.toFloat())
                 }
 
                 paint.alpha = (resolvedOpacity.coerceIn(0f, 1f) * 255).toInt()
