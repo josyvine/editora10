@@ -193,10 +193,24 @@ class Media3TransformerEngine(private val context: Context) {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
 
-        val (resolvedWidth, resolvedHeight) = if (videoWidth != null && videoHeight != null && videoWidth > 0 && videoHeight > 0) {
+        // 1. Raw Resolution Extraction
+        val rawDimensions = if (videoWidth != null && videoHeight != null && videoWidth > 0 && videoHeight > 0) {
             Pair(videoWidth, videoHeight)
         } else {
             getVideoDimensions(inputUri)
+        }
+
+        // 2. UNIVERSAL CANVAS ALIGNMENT:
+        // Guarantees that targetAspectRatio (e.g. 9:16 Shorts) sets a portrait canvas (1080x1920)
+        // instead of inheriting inverted raw sensor landscape dimensions (1920x1080).
+        val (resolvedWidth, resolvedHeight) = when (targetAspectRatio) {
+            "9:16" -> Pair(minOf(rawDimensions.first, rawDimensions.second), maxOf(rawDimensions.first, rawDimensions.second))
+            "16:9" -> Pair(maxOf(rawDimensions.first, rawDimensions.second), minOf(rawDimensions.first, rawDimensions.second))
+            "1:1" -> {
+                val minSide = minOf(rawDimensions.first, rawDimensions.second)
+                Pair(minSide, minSide)
+            }
+            else -> rawDimensions
         }
 
         val sharedVideoEffects = mutableListOf<Effect>()
