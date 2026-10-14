@@ -4,9 +4,14 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -545,8 +550,8 @@ class Media3TransformerEngine(private val context: Context) {
     /**
      * Universal Video Clone Overlay.
      * Renders ML Kit's full-color foreground subject cutout directly onto Track 1's canvas.
-     * Eliminates sudden disappearance by holding the final frame (freeze-frame hold) until the scene ends,
-     * and anchors the vertical scale to the bottom baseline to eliminate floating gaps above the desk.
+     * Applies a universal Alpha Gradient Fade (Feathering) at the bottom edge to completely 
+     * eliminate the "floating sticker" effect, allowing the torso to blend naturally into the base scene.
      */
     private class UniversalCloneBitmapOverlay(
         private val layerDto: RecipeCompositeLayerDto,
@@ -561,15 +566,26 @@ class Media3TransformerEngine(private val context: Context) {
         private val dstRect = Rect(0, 0, targetWidth, targetHeight)
         private val durationUs: Long = (layerDto.getResolvedEndMs() - layerDto.getResolvedStartMs()) * 1000L
 
+        // Universal Edge Feathering Paint (DST_OUT mode removes pixels based on gradient alpha)
+        private val fadeRatio = 0.15f // Fades out the bottom 15% of the clone bounding box
+        private val fadeStartY = targetHeight * (1.0f - fadeRatio)
+        private val fadeEndY = targetHeight.toFloat()
+        private val fadePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+            shader = LinearGradient(
+                0f, fadeStartY, 0f, fadeEndY,
+                Color.TRANSPARENT, Color.BLACK,
+                Shader.TileMode.CLAMP
+            )
+        }
+
         // Holds the last valid cutout frame so the person stays naturally seated in the scene
         private var lastValidCutout: Bitmap? = null
 
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             frameBitmap.eraseColor(Color.TRANSPARENT)
 
-            // CapCut-style Freeze Frame Hold:
-            // When the overlay take reaches its end earlier than the base scene (e.g. 5.0s < 7.5s),
-            // clamp the lookup time to durationUs so it continues holding the seated actor in frame.
+            // CapCut-style Freeze Frame Hold
             val frameLookupUs = if (durationUs > 0L) {
                 minOf(presentationTimeUs, durationUs)
             } else {
@@ -595,15 +611,18 @@ class Media3TransformerEngine(private val context: Context) {
                     canvas.translate(transX, transY)
                 }
 
-                // ANCHOR SCALE TO THE BOTTOM BASELINE:
-                // Anchoring vertical scale to the bottom edge (targetHeight) keeps the person's torso
-                // and arms firmly grounded on the table rather than floating into the air.
+                // Anchoring vertical scale to the bottom edge
                 if (resolvedScale != 1.0f && resolvedScale > 0.0f) {
                     canvas.scale(resolvedScale, resolvedScale, targetWidth / 2f, targetHeight.toFloat())
                 }
 
+                // 1. Draw the AI cutout person
                 paint.alpha = (resolvedOpacity.coerceIn(0f, 1f) * 255).toInt()
                 canvas.drawBitmap(cutoutPerson, null, dstRect, paint)
+
+                // 2. Draw Universal Alpha Gradient Fade to blend the bottom edge smoothly
+                canvas.drawRect(0f, fadeStartY, targetWidth.toFloat(), fadeEndY, fadePaint)
+
                 canvas.restore()
             }
 
