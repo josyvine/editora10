@@ -9,12 +9,9 @@
     <!-- Local Media Storage Access for Shorts and Long-Form Videos -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28"
         tools:ignore="ScopedStorage" />
 
     <!-- Audio Hardware & WebAudio Runtime Features (Non-blocking) -->
@@ -39,7 +36,8 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication"
         android:hardwareAccelerated="true"
-        android:largeHeap="true">
+        android:largeHeap="true"
+        android:requestLegacyExternalStorage="true">
 
         <!-- Google Play Services On-Device ML Kit Model Dependencies -->
         <!-- Forces Google Play Services to download the subject segmentation and vision models on app install/run -->
