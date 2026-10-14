@@ -1028,8 +1028,8 @@ class VideoProcessingPipeline(
 
     /**
      * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
-     * Rotates frames upright so ML Kit accurately detects and segments the human body without distortion,
-     * logs diagnostics cleanly to the active project session, and ensures robust bitmap memory reclamation.
+     * Logs deep, detailed diagnostic information to the system console for every processing step,
+     * reports frame-by-frame extraction milestones, and surfaces all errors explicitly.
      */
     private suspend fun extractAiSubjectMasks(
         projectId: String,
@@ -1040,9 +1040,16 @@ class VideoProcessingPipeline(
         val retriever = MediaMetadataRetriever()
 
         return@withContext try {
+            logger.log(
+                projectId,
+                PipelineStatus.TRIM_EXECUTION,
+                "Opening overlay video source for AI Cutout: ${videoFile.name} (${videoFile.length()} bytes, ${durationMs}ms)",
+                LogSeverity.INFO
+            )
+
             retriever.setDataSource(videoFile.absolutePath)
-            
-            // Extract sensor rotation (e.g. 90° portrait)
+
+            // Extract sensor rotation
             val rotationDegrees = try {
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
             } catch (_: Exception) { 0 }
@@ -1050,19 +1057,29 @@ class VideoProcessingPipeline(
                 Matrix().apply { postRotate(rotationDegrees.toFloat()) }
             } else null
 
+            logger.log(
+                projectId,
+                PipelineStatus.TRIM_EXECUTION,
+                "Initializing ML Kit Subject Segmenter (Video rotation: ${rotationDegrees}°)...",
+                LogSeverity.INFO
+            )
+
             val segmenterOptions = SubjectSegmenterOptions.Builder()
                 .enableForegroundBitmap()
-                .enableForegroundConfidenceMask()
                 .build()
             val segmenter = SubjectSegmentation.getClient(segmenterOptions)
 
             val frameStepMs = 66L // ~15fps sampling for rapid, fluid segmentation
             var timeCursorMs = 0L
+            var decodedCount = 0
+            var failureCount = 0
 
             while (timeCursorMs <= durationMs) {
                 val timeUs = timeCursorMs * 1000L
                 val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+
                 if (rawFrame != null) {
+                    decodedCount++
                     val frameToProcess = if (rotationMatrix != null) {
                         try {
                             val rotated = Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true)
@@ -1081,26 +1098,58 @@ class VideoProcessingPipeline(
                         val inputImage = InputImage.fromBitmap(frameToProcess, 0)
                         val result = Tasks.await(segmenter.process(inputImage))
                         val fgBitmap = result.foregroundBitmap
+
                         if (fgBitmap != null) {
                             maskMap[timeUs] = fgBitmap
+                        } else {
+                            failureCount++
+                            if (failureCount == 1) {
+                                logger.log(
+                                    projectId,
+                                    PipelineStatus.TRIM_EXECUTION,
+                                    "Notice: ML Kit returned null foreground bitmap at ${timeCursorMs}ms",
+                                    LogSeverity.WARNING
+                                )
+                            }
                         }
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        failureCount++
+                        if (failureCount == 1) {
+                            logger.log(
+                                projectId,
+                                PipelineStatus.TRIM_EXECUTION,
+                                "ML Kit segmentation error at ${timeCursorMs}ms: ${e.javaClass.simpleName}: ${e.message}",
+                                LogSeverity.ERROR
+                            )
+                        }
                     } finally {
                         if (!frameToProcess.isRecycled) {
                             frameToProcess.recycle()
                         }
                     }
                 }
+
+                // Log extraction milestone every 1000ms
+                if (timeCursorMs > 0 && timeCursorMs % 1000L < frameStepMs) {
+                    logger.log(
+                        projectId,
+                        PipelineStatus.TRIM_EXECUTION,
+                        "Cutout progress: ${timeCursorMs}/${durationMs}ms (${maskMap.size} valid masks extracted)",
+                        LogSeverity.INFO
+                    )
+                }
+
                 timeCursorMs += frameStepMs
             }
 
+            logger.log(
+                projectId,
+                PipelineStatus.TRIM_EXECUTION,
+                "Cutout extraction finished: Processed $decodedCount video frames -> Generated ${maskMap.size} foreground masks (Failures: $failureCount)",
+                if (maskMap.isNotEmpty()) LogSeverity.SUCCESS else LogSeverity.ERROR
+            )
+
             if (maskMap.isNotEmpty()) {
-                logger.log(
-                    projectId,
-                    PipelineStatus.TRIM_EXECUTION,
-                    "Generated ${maskMap.size} upright AI subject cutout masks across ${durationMs}ms.",
-                    LogSeverity.SUCCESS
-                )
                 val provider: (Long) -> Bitmap? = { presentationTimeUs ->
                     val floor = maskMap.floorEntry(presentationTimeUs)
                     val ceiling = maskMap.ceilingEntry(presentationTimeUs)
@@ -1116,7 +1165,12 @@ class VideoProcessingPipeline(
                 null
             }
         } catch (e: Exception) {
-            logger.log(projectId, PipelineStatus.TRIM_EXECUTION, "AI cutout extraction error: ${e.message}", LogSeverity.WARNING)
+            logger.log(
+                projectId,
+                PipelineStatus.TRIM_EXECUTION,
+                "Critical failure in AI cutout extraction: ${e.javaClass.simpleName} - ${e.message}",
+                LogSeverity.ERROR
+            )
             null
         } finally {
             try { retriever.release() } catch (_: Exception) {}
