@@ -75,6 +75,7 @@ import java.io.File
 import java.util.TreeMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
+import kotlin.math.roundToLong
 
 class VideoProcessingPipeline(
     private val context: Context,
@@ -1065,14 +1066,17 @@ class VideoProcessingPipeline(
                 .build()
             val segmenter = SubjectSegmentation.getClient(segmenterOptions)
 
-            val frameStepMs = 66L // ~15fps sampling for rapid, fluid segmentation
+            // Universal Native Frame-Rate Extraction:
+            // OPTION_CLOSEST reads precise temporal frames rather than repeating sparse keyframes.
+            // 33L (~30fps) captures rapid movements smoothly instead of stuttering like stop-motion.
+            val frameStepMs = 33L 
             var timeCursorMs = 0L
             var decodedCount = 0
             var failureCount = 0
 
             while (timeCursorMs <= durationMs) {
                 val timeUs = timeCursorMs * 1000L
-                val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
 
                 if (rawFrame != null) {
                     decodedCount++
@@ -1140,7 +1144,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         projectId,
                         PipelineStatus.TRIM_EXECUTION,
-                        "Cutout progress: ${timeCursorMs}/${durationMs}ms (${maskMap.size} valid masks extracted)",
+                        "Cutout progress: ${timeCursorMs}/${durationMs}ms (${maskMap.size} dynamic frames extracted)",
                         LogSeverity.INFO
                     )
                 }
@@ -1151,7 +1155,7 @@ class VideoProcessingPipeline(
             logger.log(
                 projectId,
                 PipelineStatus.TRIM_EXECUTION,
-                "Cutout extraction finished: Processed $decodedCount video frames -> Generated ${maskMap.size} foreground masks (Failures: $failureCount)",
+                "Cutout extraction finished: Processed $decodedCount precise video frames -> Generated ${maskMap.size} high-fps foreground masks (Failures: $failureCount)",
                 if (maskMap.isNotEmpty()) LogSeverity.SUCCESS else LogSeverity.ERROR
             )
 
