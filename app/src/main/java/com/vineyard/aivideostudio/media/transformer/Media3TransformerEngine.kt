@@ -226,7 +226,7 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. UNIVERSAL CLONE OVERLAY (Composites the ML Kit cutout directly onto Track 1)
+        // 1. UNIVERSAL CLONE OVERLAY (Composites the ML Kit cutout directly onto Track 1's canvas)
         if (compositeLayers.isNotEmpty() && maskBitmapProvider != null) {
             for (layer in compositeLayers) {
                 if (layer.layerOrder > 0) {
