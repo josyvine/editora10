@@ -1335,6 +1335,10 @@ class VideoProcessingPipeline(
         }
     }
 
+    /**
+     * Synthesizes timestamped commentary cues with silence padding.
+     * Supports both "live" (Unlimited Live API) and "tts" (REST TTS) engines.
+     */
     private suspend fun synthesizeSegmentedCommentary(
         projectId: String,
         segments: List<CommentarySegmentDto>,
@@ -1346,13 +1350,14 @@ class VideoProcessingPipeline(
         voiceEngine: String = "live"
     ): File? = withContext(Dispatchers.IO) {
         val sampleRate = 24_000
-        val bytesPerSec = sampleRate * 2
+        val bytesPerSec = sampleRate * 2 // 16-bit mono = 48,000 bytes/second
         val tempPcmFile = storageManager.createAudioOutputFile(projectId, "commentary_timeline_composite.pcm")
         val sortedSegments = segments.sortedBy { it.start ?: 0.0 }
         val totalCues = sortedSegments.size
         val isMultiple = cueMode.equals("multiple", ignoreCase = true) && concurrency > 1
 
         try {
+            // Step A: Synthesize cues (in parallel or sequentially) using the designated voiceEngine
             val segmentPcmFiles = if (isMultiple) {
                 val semaphore = Semaphore(concurrency)
                 val completedCount = AtomicInteger(0)
@@ -1361,11 +1366,11 @@ class VideoProcessingPipeline(
                     sortedSegments.mapIndexed { idx, seg ->
                         async(Dispatchers.IO) {
                             semaphore.withPermit {
-                                completedCount.incrementAndGet()
+                                val current = completedCount.incrementAndGet()
                                 logger.log(
                                     projectId,
                                     PipelineStatus.TTS_GENERATION,
-                                    "Synthesizing Cue ${idx + 1}/$totalCues [${seg.start}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
+                                    "Synthesizing Cue $current/$totalCues [${String.format("%.1f", seg.start ?: 0.0)}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
                                     LogSeverity.INFO
                                 )
                                 synthesizeSingleCueToPcm(projectId, idx, seg, tone, voiceName, voiceEngine)
@@ -1378,13 +1383,14 @@ class VideoProcessingPipeline(
                     logger.log(
                         projectId,
                         PipelineStatus.TTS_GENERATION,
-                        "Synthesizing Cue ${idx + 1}/$totalCues [${seg.start}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
+                        "Synthesizing Cue ${idx + 1}/$totalCues [${String.format("%.1f", seg.start ?: 0.0)}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
                         LogSeverity.INFO
                     )
                     synthesizeSingleCueToPcm(projectId, idx, seg, tone, voiceName, voiceEngine)
                 }
             }
 
+            // Step B: Stitch synthesized PCM cues in exact chronological order with digital silence padding
             tempPcmFile.outputStream().use { outputStream ->
                 var currentTimelineByteOffset = 0L
 
@@ -1435,6 +1441,10 @@ class VideoProcessingPipeline(
         return@withContext null
     }
 
+    /**
+     * Synthesizes an individual cue segment to a temporary PCM file based on selected engine.
+     * Uses dynamic JSON tone/persona in Script Mode.
+     */
     private suspend fun synthesizeSingleCueToPcm(
         projectId: String,
         idx: Int,
@@ -1446,11 +1456,10 @@ class VideoProcessingPipeline(
         val isLiveEngine = voiceEngine.equals("live", ignoreCase = true)
         val selectedLiveModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
 
-        var pcmFileToReturn: File? = null
-        var liveFailed = false
-
         if (isLiveEngine) {
             val segPcmFile = storageManager.createAudioOutputFile(projectId, "seg_${idx}_raw.pcm")
+            
+            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
             val characterPersona = if (!tone.isNullOrBlank()) {
                 "$tone. Recite the following script verbatim."
             } else {
@@ -1466,19 +1475,19 @@ class VideoProcessingPipeline(
             )
 
             if (segTtsResult is AppResult.Success && segPcmFile.exists() && segPcmFile.length() > 0L) {
-                pcmFileToReturn = segPcmFile
-            } else {
-                liveFailed = true
-                logger.log(
-                    projectId,
-                    PipelineStatus.TTS_GENERATION,
-                    "Live engine connection dropped for Cue ${idx + 1}. Falling back to standard REST TTS...",
-                    LogSeverity.WARNING
-                )
+                return segPcmFile
             }
-        }
 
-        if (!isLiveEngine || liveFailed) {
+            // In Live mode, do NOT fall back to REST TTS to prevent hitting the 3 RPM / 10 RPD limit.
+            logger.log(
+                projectId,
+                PipelineStatus.TTS_GENERATION,
+                "Live Voice generation alert for Cue ${idx + 1}: ${if (segTtsResult is AppResult.Error) segTtsResult.error.message else "Incomplete stream"}",
+                LogSeverity.WARNING
+            )
+            return if (segPcmFile.exists() && segPcmFile.length() > 0L) segPcmFile else null
+        } else {
+            // REST TTS Engine explicitly requested
             val segFallbackPcm = storageManager.createAudioOutputFile(projectId, "seg_${idx}_fb.pcm")
             val segM4a = storageManager.createAudioOutputFile(projectId, "seg_${idx}_fb.m4a")
             val fbRes = ttsEngine.synthesizeSpeech(
@@ -1488,12 +1497,11 @@ class VideoProcessingPipeline(
                 audioExtractor.extractAudio(Uri.fromFile(segM4a), segFallbackPcm)
                 segM4a.delete()
                 if (segFallbackPcm.exists() && segFallbackPcm.length() > 0L) {
-                    pcmFileToReturn = segFallbackPcm
+                    return segFallbackPcm
                 }
             }
+            return null
         }
-        
-        return pcmFileToReturn
     }
 
     private suspend fun synthesizeSingleBlockCommentary(
@@ -1507,11 +1515,10 @@ class VideoProcessingPipeline(
         val isLiveEngine = voiceEngine.equals("live", ignoreCase = true)
         val selectedLiveModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
 
-        var fileToReturn: File? = null
-        var liveFailed = false
-
         if (isLiveEngine) {
             val livePcmFile = storageManager.createAudioOutputFile(projectId, "commentary_live_raw.pcm")
+            
+            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
             val characterPersona = if (!tone.isNullOrBlank()) {
                 "$tone. Recite the following script verbatim."
             } else {
@@ -1530,31 +1537,16 @@ class VideoProcessingPipeline(
                 val conversionResult = pcmToM4aConverter.convert(livePcmFile, outputM4aFile, 24_000)
                 livePcmFile.delete()
                 if (conversionResult is AppResult.Success) {
-                    fileToReturn = outputM4aFile
-                } else {
-                    liveFailed = true
+                    return outputM4aFile
                 }
-            } else {
-                liveFailed = true
-                logger.log(
-                    projectId,
-                    PipelineStatus.TTS_GENERATION,
-                    "Live engine connection dropped. Falling back to standard REST TTS...",
-                    LogSeverity.WARNING
-                )
             }
-        }
-        
-        if (!isLiveEngine || liveFailed) {
+            return null
+        } else {
             val fallbackRes = ttsEngine.synthesizeSpeech(
                 TtsRequest(text = script, voiceName = voiceName ?: "Puck", outputFilePath = outputM4aFile.absolutePath)
             )
-            if (fallbackRes.success && outputM4aFile.exists()) {
-                fileToReturn = outputM4aFile
-            }
+            return if (fallbackRes.success && outputM4aFile.exists()) outputM4aFile else null
         }
-        
-        return fileToReturn
     }
 
     private suspend fun runQaCheck(
